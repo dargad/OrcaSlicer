@@ -1,0 +1,211 @@
+name: orca-slicer
+title: OrcaSlicer
+summary: Open source slicer for FDM 3D printers
+description: |
+  OrcaSlicer is an open source slicer for FDM printers. It supports a wide range
+  of printers from many manufacturers, offers advanced calibration tools,
+  precise wall and seam control, tree supports, adaptive layer heights and
+  network printing to Bambu Lab, Klipper, OctoPrint, PrusaLink and others.
+license: AGPL-3.0-only
+website: https://www.orcaslicer.com
+source-code: https://github.com/OrcaSlicer/OrcaSlicer
+issues: https://github.com/OrcaSlicer/OrcaSlicer/issues
+icon: resources/images/OrcaSlicer.svg
+adopt-info: orca-slicer
+
+base: core24
+grade: stable
+confinement: strict
+
+platforms:
+  amd64:
+  arm64:
+
+apps:
+  orca-slicer:
+    command: opt/orca-slicer/bin/orca-slicer
+    desktop: opt/orca-slicer/resources/applications/com.orcaslicer.OrcaSlicer.desktop
+    common-id: com.orcaslicer.OrcaSlicer
+    extensions: [gnome]
+    environment:
+      # ffmpeg shared libraries are installed next to the binary; the bundled
+      # libpython must win over the GNOME runtime's own libpython3.12 (3.12.3).
+      LD_LIBRARY_PATH: $SNAP/opt/orca-slicer/bin:$SNAP/opt/orca-slicer/lib/python/lib:$LD_LIBRARY_PATH
+      # The bundled OpenSSL has its build-time OPENSSLDIR (under /root/parts/...)
+      # compiled in; point it at the CA store of the base snap instead.
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      SSL_CERT_DIR: /etc/ssl/certs
+      # Same decimal separator work-around as the Flatpak entrypoint
+      LC_NUMERIC: C
+    plugs:
+      - home
+      - removable-media
+      - network
+      - network-bind       # LAN printer discovery (SSDP/mDNS) and local connections
+      - network-status     # portal NetworkMonitor/ProxyResolver (GIO connectivity checks)
+      - opengl
+      - gsettings
+      - browser-support    # WebKitGTK views (home page, printer web UIs)
+      - hardware-observe
+      - desktop
+
+parts:
+  # Third-party dependencies (Boost, wxWidgets, OCCT, CGAL, OpenVDB, ffmpeg,
+  # CPython, ...) built from source the same way as `build_linux.sh -d`.
+  # They are consumed only at build time and not shipped in the snap, except
+  # for the embedded Python runtime, which the orca-slicer part copies over.
+  orca-deps:
+    plugin: nil
+    source: .
+    build-packages:
+      - autoconf
+      - automake
+      - build-essential
+      - cmake
+      - extra-cmake-modules
+      - file
+      - gettext
+      - git
+      - libtool
+      - m4
+      - nasm
+      - ninja-build
+      - pkgconf
+      - python3
+      - texinfo
+      - wget
+      - yasm
+      - eglexternalplatform-dev
+      - libbz2-dev
+      - libcurl4-openssl-dev
+      - libdbus-1-dev
+      - libffi-dev
+      - libgl-dev
+      - libglu1-mesa-dev
+      - liblzma-dev
+      - libmspack-dev
+      - libsecret-1-dev
+      - libsqlite3-dev
+      - libssl-dev
+      - libudev-dev
+      - libwayland-dev
+      - libxkbcommon-dev
+      - uuid-dev
+      - wayland-protocols
+      - zlib1g-dev
+    build-environment: &build-env
+      - CMAKE_BUILD_PARALLEL_LEVEL: ${CRAFT_PARALLEL_BUILD_COUNT}
+      - CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      # The GNOME SDK ships its own glibc headers, and pkg-config adds them with
+      # plain -I, so GCC stops treating them as system headers and rejects
+      # wxWidgets' snprintf/vsnprintf re-declarations ("different exception
+      # specifier"). -idirafter turns those dirs into system dirs (GCC drops the
+      # duplicate -I) searched *after* the standard ones, so the host glibc and
+      # libstdc++'s <math.h>/<stdlib.h> wrappers still take precedence (putting
+      # them earlier, e.g. via CPLUS_INCLUDE_PATH, hides ::isnan & co.).
+      - CFLAGS: -idirafter /snap/gnome-46-2404-sdk/current/usr/include/${CRAFT_ARCH_TRIPLET_BUILD_FOR} -idirafter /snap/gnome-46-2404-sdk/current/usr/include
+      - CXXFLAGS: -idirafter /snap/gnome-46-2404-sdk/current/usr/include/${CRAFT_ARCH_TRIPLET_BUILD_FOR} -idirafter /snap/gnome-46-2404-sdk/current/usr/include
+    override-build: |
+      # The GNOME SDK exposes libva, which OpenCV auto-detects (WITH_VA) but
+      # then fails to compile against (va/va.h not on the include path).
+      # Upstream builds have VA disabled in practice, so turn it off explicitly.
+      grep -q -- '-DWITH_VA=OFF' deps/OpenCV/OpenCV.cmake || \
+        sed -i 's|^\(\s*\)-DWITH_OPENCL=OFF|&\n\1-DWITH_VA=OFF\n\1-DWITH_VA_INTEL=OFF|' \
+          deps/OpenCV/OpenCV.cmake
+      cmake -S deps -B deps/build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DDEP_WX_GTK3=ON \
+        -DDESTDIR="${CRAFT_PART_BUILD}/deps/build/destdir"
+      # One dependency at a time; each one still builds with
+      # CMAKE_BUILD_PARALLEL_LEVEL jobs (same as build_linux.sh).
+      cmake --build deps/build -j1
+      # The deps install as part of the build (ExternalProject), into a dir that
+      # survives snapcraft re-builds together with the stamp files; snapcraft
+      # wipes CRAFT_PART_INSTALL on every re-build, so copy the result over.
+      mkdir -p "${CRAFT_PART_INSTALL}/orca-deps"
+      cp -a deps/build/destdir/. "${CRAFT_PART_INSTALL}/orca-deps/"
+    prime:
+      - -*
+
+  orca-slicer:
+    after: [orca-deps]
+    plugin: nil
+    source: .
+    build-packages:
+      - cmake
+      - extra-cmake-modules
+      - gettext
+      - git
+      - ninja-build
+      - pkgconf
+      - python3
+      - libdbus-1-dev
+      - libgl-dev
+      - libglu1-mesa-dev
+      - libudev-dev
+      - libwayland-dev
+      - libxkbcommon-dev
+      - wayland-protocols
+    stage-packages:
+      - libopengl0
+    build-environment: *build-env
+    override-pull: |
+      craftctl default
+      # CI writes the full version (e.g. with a +git suffix for edge) here
+      if [ -s snap/local/version ]; then
+        craftctl set version="$(cat snap/local/version)"
+      else
+        craftctl set version="$(sed -n 's/^set(SoftFever_VERSION "\(.*\)")/\1/p' version.inc)"
+      fi
+    override-build: |
+      DEPS="${CRAFT_STAGE}/orca-deps/usr/local"
+      PREFIX=/opt/orca-slicer
+      ROOT="${CRAFT_PART_INSTALL}${PREFIX}"
+      # The GNOME SDK's libpython3.12 (3.12.3) on LD_LIBRARY_PATH would otherwise
+      # be loaded by the bundled interpreter, failing CMake's exact version check.
+      export LD_LIBRARY_PATH="${DEPS}/libpython/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
+      # Portable (non-FHS) layout, so resources are found relative to the binary.
+      # Out-of-source build dir: the POST_BUILD resources symlink must not land
+      # inside the installed resources directory.
+      cmake -S . -B build -G Ninja \
+        -DCMAKE_PREFIX_PATH="${DEPS}" \
+        -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DSLIC3R_STATIC=ON \
+        -DSLIC3R_GTK=3 \
+        -DSLIC3R_FHS=OFF \
+        -DSLIC3R_DESKTOP_INTEGRATION=OFF \
+        -DBBL_RELEASE_TO_PUBLIC=1 \
+        -DORCA_TOOLS=ON
+      cmake --build build
+      # Compile the translations into resources/i18n before they are installed
+      ./scripts/run_gettext.sh
+      DESTDIR="${CRAFT_PART_INSTALL}" cmake --install build
+
+      # Per-vendor preset caches, as the other release packages ship them
+      if [ -x scripts/build_preset_cache.sh ]; then
+        ./scripts/build_preset_cache.sh -n -b build "${ROOT}/resources/profiles"
+      fi
+
+      # Embedded Python runtime (plugins). OrcaSlicer looks for it in
+      # <resources>/../lib/python; the binary's RUNPATH expects libpython in
+      # $ORIGIN/../libpython/lib.
+      if [ -d "${DEPS}/libpython" ]; then
+        mkdir -p "${ROOT}/lib"
+        cp -a "${DEPS}/libpython" "${ROOT}/lib/python"
+        rm -rf "${ROOT}/lib/python/include"
+        ln -sfn lib/python "${ROOT}/libpython"
+      fi
+
+      # Make the bundled fonts known to fontconfig, so OrcaSlicer does not have
+      # to register them with AddPrivateFont (which crashes newer Pango).
+      install -Dm644 -t "${CRAFT_PART_INSTALL}/usr/share/fonts/OrcaSlicer/" resources/fonts/*.ttf
+
+      # Point the desktop entry at the snap icon
+      sed -i 's|^Icon=.*|Icon=${SNAP}/meta/gui/icon.svg|' \
+        "${ROOT}/resources/applications/com.orcaslicer.OrcaSlicer.desktop"
+    prime:
+      - -usr/share/doc
+      - -usr/include
+      - -usr/lib/*/pkgconfig
