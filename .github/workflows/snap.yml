@@ -1,0 +1,165 @@
+name: Snap
+
+# Keeps the fork in sync with upstream and publishes the snap:
+#  * main is fast-forwarded to upstream/main
+#  * snap (the packaging commits) is rebased on top of it
+#  * the rebased snap branch is built and released to edge
+#  * the newest upstream release tag (v*) is built once with the packaging
+#    commits on top and released to beta; the snap-<tag> branch pushed for it
+#    marks the tag as done
+#
+# Required secrets:
+#  SYNC_TOKEN                   PAT with contents + workflows write access to
+#                               this repo (GITHUB_TOKEN may not push commits
+#                               touching .github/workflows, which both upstream
+#                               and the rebased snap branch do)
+#  SNAPCRAFT_STORE_CREDENTIALS  output of `snapcraft export-login`
+#
+# Scheduled workflows only run from the default branch, so this file must
+# live on the repository's default branch (snap).
+
+on:
+  schedule:
+    - cron: '47 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force-edge:
+        description: Build and release to edge even if nothing changed
+        type: boolean
+        default: false
+      force-beta:
+        description: Build and release the latest tag to beta even if done before
+        type: boolean
+        default: false
+
+concurrency:
+  group: snap
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: https://github.com/OrcaSlicer/OrcaSlicer.git
+  UPSTREAM_BRANCH: main
+  SNAP_BRANCH: snap
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SNAP_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Sync main with upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM"
+          # --force: upstream moves some tags (e.g. nightly-builds)
+          git fetch --force --tags upstream "$UPSTREAM_BRANCH"
+          # Fast-forward only: fails loudly if the fork's main has diverged
+          git push origin "upstream/$UPSTREAM_BRANCH:refs/heads/$UPSTREAM_BRANCH"
+
+      - name: Rebase snap branch
+        id: rebase
+        run: |
+          old=$(git rev-parse HEAD)
+          git rebase "upstream/$UPSTREAM_BRANCH"
+          new=$(git rev-parse HEAD)
+          if [ "$old" != "$new" ]; then
+            git push --force-with-lease="$SNAP_BRANCH:$old" origin "HEAD:refs/heads/$SNAP_BRANCH"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare beta branch for the latest release tag
+        id: beta
+        env:
+          FORCE: ${{ inputs.force-beta }}
+        run: |
+          # Release tags live on release/* branches as well as on main, so take
+          # the highest version rather than the nearest tag; with the '-'
+          # suffix rule v2.4.0-beta sorts before v2.4.0.
+          tag=$(git -c versionsort.suffix=- tag -l 'v[0-9]*' --sort=-v:refname | head -n1)
+          [ -n "$tag" ] || exit 0
+          version=$(git show "$tag:version.inc" | sed -n 's/^set(SoftFever_VERSION "\(.*\)")/\1/p')
+          branch="snap-$tag"
+          echo "Latest tag $tag (version $version)"
+          if [ "$FORCE" != true ] && git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            echo "$branch already exists, beta already built for $tag"
+            exit 0
+          fi
+
+          # Packaging commits replayed on top of the tag
+          git switch -c "$branch" HEAD
+          git rebase --onto "$tag" "upstream/$UPSTREAM_BRANCH"
+          git push --force origin "HEAD:refs/heads/$branch"
+          echo "ref=$branch" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build target list
+        id: targets
+        env:
+          EDGE: ${{ steps.rebase.outputs.changed == 'true' || inputs.force-edge }}
+          BETA_REF: ${{ steps.beta.outputs.ref }}
+          BETA_VERSION: ${{ steps.beta.outputs.version }}
+        run: |
+          targets='[]'
+          if [ "$EDGE" = true ]; then
+            base=$(git show "upstream/$UPSTREAM_BRANCH:version.inc" | sed -n 's/^set(SoftFever_VERSION "\(.*\)")/\1/p')
+            version="$base+git$(git rev-parse --short=8 "upstream/$UPSTREAM_BRANCH")"
+            targets=$(jq -c --arg r "$SNAP_BRANCH" --arg v "$version" \
+              '. + [{channel: "edge", ref: $r, version: $v}]' <<< "$targets")
+          fi
+          if [ -n "$BETA_REF" ]; then
+            targets=$(jq -c --arg r "$BETA_REF" --arg v "$BETA_VERSION" \
+              '. + [{channel: "beta", ref: $r, version: $v}]' <<< "$targets")
+          fi
+          echo "targets=$targets" | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.targets != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.sync.outputs.targets) }}
+        # Add ubuntu-24.04-arm to also build and release arm64
+        runner: [ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.target.channel }} (${{ matrix.runner }})
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.target.ref }}
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache /usr/local/share/boost
+          df -h /
+
+      - name: Set snap version
+        env:
+          VERSION: ${{ matrix.target.version }}
+        run: |
+          mkdir -p snap/local
+          echo "$VERSION" > snap/local/version
+
+      - uses: snapcore/action-build@v1
+        id: build
+
+      - uses: snapcore/action-publish@v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        with:
+          snap: ${{ steps.build.outputs.snap }}
+          release: ${{ matrix.target.channel }}
